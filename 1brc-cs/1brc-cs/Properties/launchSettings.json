@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "1brc-cs": {
+      "commandName": "Project",
+      "commandLineArgs": "-verify -noresult"
+    }
+  }
+}
