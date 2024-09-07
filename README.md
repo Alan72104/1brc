@@ -1,5 +1,54 @@
 # 1️⃣🐝🏎️ The One Billion Row Challenge
 
+## Idiomatic C#/.NET solution
+Unmapping takes about 1s consistently on my machine
+### 1b dataset at ~2.3s
+```
+K:\>hyperfine -w 1 -r 20 "K:\1brc-cs\1brc-cs\bin\Release\net8.0\1brc-cs.exe -noresult -noprint" "K:\1brc-cs\1brc-cs\bin\
+Release\net8.0\publish\win-x64\1brc-cs.exe -noresult -noprint"
+Benchmark 1: K:\1brc-cs\1brc-cs\bin\Release\net8.0\1brc-cs.exe -noresult -noprint
+  Time (mean ± σ):      3.287 s ±  0.028 s    [User: 32.603 s, System: 5.762 s]
+  Range (min … max):    3.239 s …  3.331 s    20 runs
+
+Benchmark 2: K:\1brc-cs\1brc-cs\bin\Release\net8.0\publish\win-x64\1brc-cs.exe -noresult -noprint
+  Time (mean ± σ):      3.391 s ±  0.035 s    [User: 33.939 s, System: 5.608 s]
+  Range (min … max):    3.274 s …  3.426 s    20 runs
+
+Summary
+  K:\1brc-cs\1brc-cs\bin\Release\net8.0\1brc-cs.exe -noresult -noprint ran
+    1.03 ± 0.01 times faster than K:\1brc-cs\1brc-cs\bin\Release\net8.0\publish\win-x64\1brc-cs.exe -noresult -noprint
+```
+### 1b 10k stations dataset at ~4.5s using builtin hashing (xxHash32)
+```
+K:\>hyperfine -w 1 -r 20 "K:\1brc-cs\1brc-cs\bin\Release\net8.0\1brc-cs.exe -noresult -noprint" "K:\1brc-cs\1brc-cs\bin\Release\net8.0\publish\win-x64\1brc-cs.exe -noresult -noprint"
+Benchmark 1: K:\1brc-cs\1brc-cs\bin\Release\net8.0\1brc-cs.exe -noresult -noprint
+  Time (mean ± σ):      5.524 s ±  0.144 s    [User: 59.663 s, System: 9.925 s]
+  Range (min … max):    5.323 s …  5.707 s    20 runs
+
+Benchmark 2: K:\1brc-cs\1brc-cs\bin\Release\net8.0\publish\win-x64\1brc-cs.exe -noresult -noprint
+  Time (mean ± σ):      5.650 s ±  0.036 s    [User: 63.062 s, System: 9.815 s]
+  Range (min … max):    5.599 s …  5.743 s    20 runs
+
+Summary
+  K:\1brc-cs\1brc-cs\bin\Release\net8.0\1brc-cs.exe -noresult -noprint ran
+    1.02 ± 0.03 times faster than K:\1brc-cs\1brc-cs\bin\Release\net8.0\publish\win-x64\1brc-cs.exe -noresult -noprint
+```
+### Using 8 cores
+Scaling to the baseline timing `04:49.679` gives `3.758s / 203.180s * 04:49.679` = **5.358s**
+```
+K:\>hyperfine -w 1 -r 10 "K:\1brc-cs\1brc-cs\bin\Release\net8.0\1brc-cs.exe -noresult -noprint"
+Benchmark 1: K:\1brc-cs\1brc-cs\bin\Release\net8.0\1brc-cs.exe -noresult -noprint
+  Time (mean ± σ):      4.758 s ±  0.022 s    [User: 11.542 s, System: 2.015 s]
+  Range (min … max):    4.709 s …  4.786 s    10 runs
+
+K:\>hyperfine -w 1 -r 10 "K:\calculate_average_baseline.bat"
+Benchmark 1: K:\calculate_average_baseline.bat
+  Time (mean ± σ):     203.180 s ±  0.953 s    [User: 50.318 s, System: 1.394 s]
+  Range (min … max):   201.899 s … 204.232 s    10 runs
+```
+
+---
+
 _Status Feb 4: The final leaderboards [have been published](https://www.morling.dev/blog/1brc-results-are-in/). Congrats to all the winners, and a big thank you to everyone participating in this challenge as well as to everyone helping to organize it!_
 
 _Status Feb 3: All entries have been evaluated and I am in the process of finalizing the leaderboards._

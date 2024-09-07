@@ -1,4 +1,8 @@
-﻿using System.Diagnostics;
+﻿//#define USE_BUILTIN_MAP
+//#define USE_BUILTIN_HASH
+
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -8,15 +12,52 @@ namespace _1brc_cs;
 
 internal class Program2
 {
+    // A non owning unsafe ReadOnlySpan<byte>
+    unsafe readonly struct Utf8String : IEquatable<Utf8String>, IComparable<Utf8String>
+    {
+        public readonly int Hash;
+        public readonly int Length;
+        public readonly byte* Ptr;
+
+        public ReadOnlySpan<byte> Span => new(Ptr, Length);
+
+        public Utf8String(int hash, ReadOnlySpan<byte> span)
+        {
+            Hash = hash;
+            Length = span.Length;
+            fixed (byte* ptr = span)
+                Ptr = ptr;
+        }
+
+        public override int GetHashCode() => Hash;
+
+        public bool Equals(Utf8String other) => Hash == other.Hash && Span.SequenceEqual(other.Span);
+
+        public override bool Equals([NotNullWhen(true)] object? obj) => throw new NotImplementedException();
+
+        public override string ToString() => Encoding.UTF8.GetString(Span);
+
+        public int CompareTo(Utf8String other) => Span.SequenceCompareTo(other.Span);
+
+        public static bool operator ==(Utf8String a, Utf8String b) => a.Equals(b);
+
+        public static bool operator !=(Utf8String a, Utf8String b) => !a.Equals(b);
+    }
+
     struct StationEntry
     {
-        public StationEntry() { }
+        public StationEntry(Utf8String name)
+        {
+            Name = name;
+        }
 
-        public int NameHash;
-        public bool Collided;
-        public int NameLength;
-        public NameSpan Name;
-        public string? NameStr;
+        public readonly Utf8String Name;
+        public StationData Data;
+    }
+
+    struct StationData
+    {
+        public StationData() { }
 
         public long Count;
         public long Sum;
@@ -24,25 +65,19 @@ internal class Program2
         public long Max = long.MinValue;
 
         public double Avg; // Stored normally for verifying
-
-        [InlineArray(100)]
-        public struct NameSpan
-        {
-            private byte _element0;
-        }
     }
 
     //const int TableSize = 2048;
     const int TableSize = 16384;
-    //const int TableSize = 131072;
+    //const int TableSize = 16384 << 2;
 
-    //const string path = @"D:\repos\1brc\measurements_100.txt";
-    //const string resultPath = @"D:\repos\1brc\result_100.txt";
-    //const long correctMeasurmentCount = 100;
+    const string path = @"measurements.txt";
+    const string resultPath = @"result_1b.txt";
+    const long correctMeasurementCount = 1_000_000_000;
 
-    const string path = @"D:\repos\1brc\measurements.txt";
-    const string resultPath = @"D:\repos\1brc\result_1b.txt";
-    const long correctMeasurmentCount = 1_000_000_000;
+    //const string path = @"measurements3.txt";
+    //const string resultPath = @"result_10k_1b.txt";
+    //const long correctMeasurementCount = 1_000_000_000;
 
     static unsafe void Main(string[] args)
     {
@@ -53,48 +88,67 @@ internal class Program2
         Stopwatch timer = Stopwatch.StartNew();
         Stopwatch timerUnmap = Stopwatch.StartNew();
 
-        List<Task> tasks = new();
-        Dictionary<string, StationEntry> result = new();
-        long totalEntries = 0;
-        List<int> searchItereations = new();
-
         using (var file = MemoryMappedFile.CreateFromFile(path))
         {
+            Dictionary<Utf8String, StationData> result = new();
+            long totalEntries = 0;
+            List<int> searchIterations = new();
+
             using var assessor = file.CreateViewAccessor(0, 0, MemoryMappedFileAccess.Read);
             byte* filePtr = null;
             try
             {
                 assessor.SafeMemoryMappedViewHandle.AcquirePointer(ref filePtr);
+                if (filePtr is null)
+                    throw new Exception($"filePtr is null");
                 long fileSize = assessor.Capacity;
+                int chunkSize = 150_000_000;
+
                 int procs = Environment.ProcessorCount;
-                int partitionSize = (int)Math.Ceiling((double)fileSize / procs);
-                bool first = true;
+                //int procs = 8;
 
                 if (!noPrint)
-                    Console.WriteLine($"file size {fileSize:n0} part size {partitionSize:n0} procs {procs}");
-                for (long fileIdx = 0; fileIdx < fileSize; fileIdx += partitionSize)
+                    Console.WriteLine($"File size {fileSize:n0} chunk size {chunkSize:n0} procs {procs}");
+
+                long cursor = 0;
+
+                List<Task> tasks = new();
+                for (int i = 0; i < procs; i++)
                 {
-                    int len = (int)Math.Min(fileSize - fileIdx, partitionSize);
-                    long partitionStart = fileIdx;
-                    bool isFirst = first || filePtr[fileIdx - 1] == (byte)'\n';
                     tasks.Add(Task.Run(() =>
                     {
-                        Span<byte> buf = new Span<byte>(filePtr + partitionStart, (int)Math.Min(fileSize - partitionStart, int.MaxValue));
-                        StationEntry[] table = new StationEntry[TableSize];
-                        int maxSearchIterations = 0;
-
-                        int entries = ParsePartition(buf, len, table, isFirst, ref maxSearchIterations);
-
-                        Interlocked.Add(ref totalEntries, entries);
-                        lock (result)
-                            AccumulateResult(result, table);
-                        lock (searchItereations)
-                            searchItereations.Add(maxSearchIterations);
+                        WorkerLoop(filePtr, fileSize, ref cursor, ref totalEntries, chunkSize, result, searchIterations);
                     }));
-                    first = false;
                 }
 
                 Task.WhenAll(tasks).ConfigureAwait(false).GetAwaiter().GetResult();
+
+                foreach (var (name, e) in result.OrderBy(e => e.Key))
+                {
+                    var e2 = e;
+                    e2.Avg = Math.Round((double)e.Sum / 10 / e.Count * 10) / 10;
+                    if (!noResult)
+                        Console.WriteLine($"{name,25} ({name.Hash & (TableSize - 1):X8}) " +
+                            $"min {e.Min / 10.0,5:n1} avg {e2.Avg,5:n1} max {e.Max / 10.0,5:n1} cnt {e.Count,10}");
+                    result[name] = e2;
+                }
+
+                timer.Stop();
+
+                if (verify && resultPath != "" && File.Exists(resultPath))
+                {
+                    Dictionary<string, StationData> resultWithChars = result
+                        .ToDictionary(e => e.Key.ToString(), e => e.Value);
+                    Verify(resultWithChars, resultPath, correctMeasurementCount);
+                }
+
+                if (!noPrint)
+                {
+                    Console.WriteLine($"{timer.Elapsed}");
+                    Console.WriteLine($"totalEntries {totalEntries:n0}");
+                    Console.WriteLine($"Station count {result.Count:n0}");
+                    Console.WriteLine($"maxSearchIterations {searchIterations.Max():n0}");
+                }
             }
             finally
             {
@@ -102,60 +156,94 @@ internal class Program2
             }
             timerUnmap.Restart();
         }
-        timerUnmap.Stop();
-
-        foreach (var (name, e) in result.OrderBy(e => e.Key))
-        {
-            var e2 = e;
-            e2.Avg = Math.Round((double)e.Sum / 10 / e.Count * 10) / 10;
-            if (!noResult)
-                Console.WriteLine($"{name,25} min {e.Min / 10.0,5:n1} avg {e2.Avg,5:n1} max {e.Max / 10.0,5:n1} cnt {e.Count,10}");
-            result[name] = e2;
-        }
-
-        timer.Stop();
-
-        if (verify)
-            Verify(result, resultPath, correctMeasurmentCount);
-
-        if (!noPrint)
-        {
-            Console.WriteLine($"{timer.Elapsed - timerUnmap.Elapsed}");
-            Console.WriteLine($"totalEntries {totalEntries:n0}");
-            Console.WriteLine($"station count {result.Count:n0}");
-            Console.WriteLine($"maxSearchIterations {searchItereations.Max():n0}");
-            Console.WriteLine($"unmap took {timerUnmap.Elapsed}");
-        }
+        Console.WriteLine($"Unmap took {timerUnmap.Elapsed}");
     }
 
-    static void AccumulateResult(Dictionary<string, StationEntry> result, StationEntry[] table)
+    static void AccumulateResult(Dictionary<Utf8String, StationData> result, StationEntry[] table)
     {
         IEnumerable<int> indexes = Enumerable
             .Range(0, TableSize)
-            .Where(i => table[i].NameLength > 0);
+            .Where(i => table[i].Name.Length > 0);
+        Console.WriteLine($"Accumulating {indexes.Count()}");
         foreach (int i in indexes)
         {
-            string name = Encoding.UTF8.GetString(((Span<byte>)table[i].Name).Slice(0, table[i].NameLength));
-            ref StationEntry entry = ref CollectionsMarshal.GetValueRefOrAddDefault(result, name, out bool exists);
+            ref StationEntry entry = ref table[i];
+            ref StationData resultData = ref CollectionsMarshal.GetValueRefOrAddDefault(result, entry.Name, out bool exists);
             if (!exists)
-                entry = new();
-            entry.Sum += table[i].Sum;
-            entry.Count += table[i].Count;
-            entry.Min = Math.Min(entry.Min, table[i].Min);
-            entry.Max = Math.Max(entry.Max, table[i].Max);
+                resultData = new();
+            resultData.Sum += entry.Data.Sum;
+            resultData.Count += entry.Data.Count;
+            resultData.Min = Math.Min(resultData.Min, entry.Data.Min);
+            resultData.Max = Math.Max(resultData.Max, entry.Data.Max);
         }
     }
 
-    static int ParsePartition(
-        Span<byte> span,
+    static void AccumulateResult(Dictionary<Utf8String, StationData> result, Dictionary<Utf8String, StationData> table)
+    {
+        Console.WriteLine($"Accumulating {table.Count}");
+        foreach (var (name, data) in table)
+        {
+            ref StationData resultData = ref CollectionsMarshal.GetValueRefOrAddDefault(result, name, out bool exists);
+            if (!exists)
+                resultData = new();
+            resultData.Sum += data.Sum;
+            resultData.Count += data.Count;
+            resultData.Min = Math.Min(resultData.Min, data.Min);
+            resultData.Max = Math.Max(resultData.Max, data.Max);
+        }
+    }
+
+    static unsafe void WorkerLoop(
+        byte* filePtr,
+        long fileSize,
+        ref long cursor,
+        ref long totalEntries,
+        int chunkSize,
+        Dictionary<Utf8String, StationData> result,
+        List<int> searchIterations)
+    {
+#if USE_BUILTIN_MAP
+        Dictionary<Utf8String, StationData> table = new(TableSize);
+#else
+        StationEntry[] table = new StationEntry[TableSize];
+#endif
+        int maxSearchIterations = 0;
+        long entries = 0;
+
+        long chunkIdx = 0;
+        while ((chunkIdx = Interlocked.Add(ref cursor, chunkSize) - chunkSize) < fileSize)
+        {
+            int len = (int)Math.Min(chunkSize, fileSize - chunkIdx);
+            Console.WriteLine($"Parsing chunk at {chunkIdx:n0} of size {len:n0}");
+            bool isLineStart = chunkIdx == 0 || filePtr[chunkIdx - 1] == (byte)'\n';
+            // Make the span extend over the chunk end to read the cropped line
+            ReadOnlySpan<byte> span = new(
+                filePtr + chunkIdx,
+                (int)Math.Min(fileSize - chunkIdx, int.MaxValue));
+            entries += ParseChunk(span, len, table, isLineStart, ref maxSearchIterations);
+        }
+
+        Interlocked.Add(ref totalEntries, entries);
+        lock (result)
+            AccumulateResult(result, table);
+        lock (searchIterations)
+            searchIterations.Add(maxSearchIterations);
+    }
+
+    static long ParseChunk(
+        ReadOnlySpan<byte> span,
         int length,
+#if USE_BUILTIN_MAP
+        Dictionary<Utf8String, StationData> table,
+#else
         StationEntry[] table,
-        bool isFirst,
+#endif
+        bool isLineStart,
         ref int maxSearchIterations)
     {
-        int totalEntries = 0;
+        long totalEntries = 0;
         int idx = 0;
-        if (!isFirst)
+        if (!isLineStart)
             idx = span.IndexOf((byte)'\n') + 1;
 
         while (idx < length)
@@ -165,22 +253,26 @@ internal class Program2
                 break;
             newLineIdx += idx;
 
-            Span<byte> line = span.Slice(idx, newLineIdx - idx);
+            ReadOnlySpan<byte> line = span.Slice(idx, newLineIdx - idx);
 
             int start = 0;
             int sepIdx = line.IndexOf((byte)';');
 
-            Span<byte> name = line.Slice(0, sepIdx);
+            ReadOnlySpan<byte> name = line.Slice(0, sepIdx);
             start = sepIdx + 1;
 
             int temperature = ParseToInt(line.Slice(start));
 
-            ref StationEntry entry = ref FindEntry(table, name,
-                ref maxSearchIterations);
-            entry.Sum += temperature;
-            entry.Count++;
-            entry.Min = Math.Min(entry.Min, temperature);
-            entry.Max = Math.Max(entry.Max, temperature);
+#if USE_BUILTIN_MAP
+            ref StationData data = ref FindEntry(table, name);
+#else
+            ref StationData data = ref FindEntry(table, name, ref maxSearchIterations).Data;
+#endif
+            data.Sum += temperature;
+            data.Count++;
+            data.Min = Math.Min(data.Min, temperature);
+            data.Max = Math.Max(data.Max, temperature);
+
 
             idx = newLineIdx + 1;
             totalEntries++;
@@ -190,64 +282,71 @@ internal class Program2
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static int DoHash(Span<byte> name)
+    static int DoHash(ReadOnlySpan<byte> name)
     {
-        //HashCode hasher = new();
-        //hasher.AddBytes(name);
-        //return hasher.ToHashCode();
+#if USE_BUILTIN_HASH
+        HashCode hasher = new();
+        hasher.AddBytes(name);
+        return hasher.ToHashCode();
+#else
         int hash = 0;
-        int i;
-        for (i = 0; i + 4 <= name.Length; i += 4)
-            hash += Unsafe.As<byte, int>(ref name[i]);
-        for (i = name.Length / 4 * 4; i < name.Length; i++)
-            hash += name[i];
+        int i = 0;
+        while (i + 4 <= name.Length)
+        {
+            hash += Unsafe.As<byte, int>(ref MemoryMarshal.GetReference(name));
+            i += 4;
+        }
+        while (i < name.Length)
+            hash += name[i++];
         return hash;
+#endif
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static ref StationData FindEntry(
+        Dictionary<Utf8String, StationData> table,
+        ReadOnlySpan<byte> nameSpan)
+    {
+        int hash = DoHash(nameSpan);
+        Utf8String name = new(hash, nameSpan);
+        ref StationData entry = ref CollectionsMarshal.GetValueRefOrAddDefault(table, name, out bool exists);
+        if (!exists)
+            entry = new();
+        return ref entry;
+    }
+
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     static ref StationEntry FindEntry(
         StationEntry[] table,
-        Span<byte> name,
+        ReadOnlySpan<byte> nameSpan,
         ref int maxSearchIterations)
     {
-        int hash = DoHash(name);
+        int hash = DoHash(nameSpan);
+        Utf8String name = new(hash, nameSpan);
         int i = hash & (TableSize - 1);
         ref StationEntry entry = ref table[i];
         int searchIterations = 0;
-        bool collided = false;
         while (true)
         {
             entry = ref table[i];
-            if (entry.NameLength == 0)
-                break;
-            if (entry.NameHash == hash)
-            {
-                if (!entry.Collided ||
-                    ((Span<byte>)entry.Name).Slice(0, entry.NameLength)
-                        .SequenceEqual(name))
-                {
-                    break;
-                }
-                entry.Collided = true;
-                collided = true;
-            }
             searchIterations++;
+            if (searchIterations > TableSize)
+                throw new Exception("Table overflowed");
+            if (entry.Name.Length == 0)
+                break;
+            if (entry.Name == name)
+                break;
             i = (i + 1) & (TableSize - 1);
         }
-        if (entry.NameLength == 0)
-        {
-            entry = new();
-            entry.NameHash = hash;
-            entry.NameLength = name.Length;
-            entry.Collided = collided;
-            name.CopyTo(entry.Name);
-        }
+        if (entry.Name.Length == 0)
+            entry = new(name);
         maxSearchIterations = Math.Max(maxSearchIterations, searchIterations);
         return ref entry;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static int ParseToInt(Span<byte> span)
+    static int ParseToInt(ReadOnlySpan<byte> span)
     {
         int neg = 1;
         int num = 0;
@@ -263,37 +362,36 @@ internal class Program2
         return num * neg;
     }
 
-    static void Verify(Dictionary<string, StationEntry> result, string resultPath, long correctMeasurementCount)
+    static void Verify(Dictionary<string, StationData> result, string resultPath, long correctMeasurementCount)
     {
-        Dictionary<string, StationEntry> official = File.ReadAllLines(resultPath)
+        Dictionary<string, StationData> official = File.ReadAllLines(resultPath)
             .Select(line =>
             {
                 string[] name = line.Split('=', 2);
                 string[] data = name[^1].Split('/', 3);
-                StationEntry entry = new();
-                entry.NameStr = name[0];
-                entry.Min = (long)(double.Parse(data[0]) * 10);
-                entry.Avg = double.Parse(data[1]);
-                entry.Max = (long)(double.Parse(data[2]) * 10);
-                return entry;
+                StationData sd = new();
+                sd.Min = (long)(double.Parse(data[0]) * 10);
+                sd.Avg = double.Parse(data[1]);
+                sd.Max = (long)(double.Parse(data[2]) * 10);
+                return (name[0], sd);
             })
-            .ToDictionary(e => e.NameStr!, e => e);
+            .ToDictionary();
         if (official.Count != result.Count)
             Console.WriteLine($"! station count should be {official.Count} but is {result.Count}");
         long measurementCount = result.Sum(e => e.Value.Count);
         if (measurementCount != correctMeasurementCount)
             Console.WriteLine($"! measurement count should be {correctMeasurementCount} but is {measurementCount}");
-        List<string> missedStations = official.Keys.Except(result.Keys).Order().ToList();
-        foreach (string s in missedStations)
-            Console.WriteLine($"! missing station \"{s}\"");
+        List<string> missingStations = official.Keys.Except(result.Keys).Order().ToList();
+        foreach (string s in missingStations)
+            Console.WriteLine($"! missing station ({Encoding.UTF8.GetByteCount(s)}) \"{s}\"");
         List<string> extraStations = result.Keys.Except(official.Keys).Order().ToList();
         foreach (string s in extraStations)
             Console.WriteLine($"! extra station ??? \"{s}\"");
-        var sortedOfficial = official.Keys.Except(missedStations).Order().ToList();
+        var sortedOfficial = official.Keys.Except(missingStations).Order().ToList();
         foreach (string name in sortedOfficial)
         {
-            StationEntry a = official[name];
-            StationEntry b = result[name];
+            StationData a = official[name];
+            StationData b = result[name];
             if (!(a.Min == b.Min && a.Avg == b.Avg && a.Max == b.Max))
             {
                 string sa = $"{a.Min / 10.0:n1}/{a.Avg:n1}/{a.Max / 10.0:n1}";
